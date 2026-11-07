@@ -1,0 +1,33 @@
+# The linked WhatsApp session. It IS the login: never commit it.
+auth/
+creds.json
+qr.png
+
+# Your real config (chat IDs, group names, your name). Commit only the example.
+muse-config.json
+listener.env
+
+# Runtime data: stored messages, prompts, state, locks, logs.
+store/
+requests/
+media/
+.tmp/
+muse-state.json
+listener-state.json
+wa-version.json
+audit.log
+session.lock
+listener.sock
+listener.autostart
+.listener-revive-at
+*.log
+
+# Release bundles and handoffs for the VM (they name people and paths).
+dist/
+HANDOFF-VM.md
+
+# Local backups made before each edit.
+*.bak-*
+
+node_modules/
+.DS_Store

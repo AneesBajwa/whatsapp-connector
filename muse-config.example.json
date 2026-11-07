@@ -1,0 +1,27 @@
+{
+  "watchlist": [
+    {
+      "jid": "120363111111111111@g.us",
+      "name": "Family"
+    },
+    {
+      "jid": "120363222222222222@g.us",
+      "name": "Weekend plans"
+    }
+  ],
+  "triggerWord": "agent",
+  "replyPrefix": "Muse: ",
+  "ownerName": "Alex",
+  "promptMaxAgeMinutes": 60,
+  "contextMessages": 30,
+  "limits": {
+    "promptsPerChatPerHour": 20,
+    "repliesPerPrompt": 3,
+    "repliesPerChatPerHour": 30
+  },
+  "expireAfterMinutes": 30,
+  "health": {
+    "alertAfterMinutes": 10
+  },
+  "retentionDays": 90
+}

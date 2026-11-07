@@ -1,0 +1,36 @@
+# systemd unit for the WhatsApp push listener (bin/listen.cjs).
+# Replace the four <...> values (get the node path with: command -v node), then:
+#   sudo cp deploy/muse-whatsapp-listener.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now muse-whatsapp-listener
+#   journalctl -u muse-whatsapp-listener -f
+#
+# Exit codes: 0 stopped by a signal, 1 error (restarted), 2 no linked session
+# in auth/ (not restarted: the listener never pairs; the device must be linked
+# from home with pair-qr).
+
+[Unit]
+Description=Muse WhatsApp listener (Baileys connector)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<user that owns the connector folder>
+WorkingDirectory=<absolute path to the connector folder>
+# Node's fetch (WhatsApp version lookup) only uses the proxy with this set.
+Environment=NODE_USE_ENV_PROXY=1
+# HTTPS_PROXY=... and anything else the VM needs; keep this file mode 600.
+EnvironmentFile=-<absolute path to the connector folder>/listener.env
+ExecStart=<absolute path to node> bin/listen.cjs
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2
+UMask=0077
+# SIGTERM: the listener saves the store, closes the connection and releases
+# session.lock before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
