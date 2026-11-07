@@ -9,7 +9,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "https-proxy-agent": "9.1.0",

@@ -81,3 +81,7 @@ About 200 offline tests, taking around 5 minutes. They use temporary folders and
 | `listener-state.json` | Heartbeat |
 | `audit.log` | Audit trail |
 | `session.lock`, `listener.sock` | One-process lock and the CLI socket |
+
+## License
+
+MIT, see [LICENSE](LICENSE). This project is not affiliated with WhatsApp or Meta, and it uses an unofficial client library. Use it on your own account, at your own risk.
