@@ -20,6 +20,8 @@ session.lock
 listener.sock
 listener.autostart
 .listener-revive-at
+deploy/.listener-scope
+deploy/.install-listener.*
 *.log
 
 # Release bundles and handoffs for the VM (they name people and paths).

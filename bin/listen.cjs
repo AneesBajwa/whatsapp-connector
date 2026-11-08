@@ -12,7 +12,21 @@
  * session in auth/ it exits with code 2. It holds session.lock for its whole
  * life, so a second listener or a one-shot CLI run can never connect alongside it.
  *
- * Exit codes: 0 stopped by a signal, 1 error, 2 no linked session.
+ * Event-driven throughout; nothing here runs on an interval:
+ * - messages arrive as events from WhatsApp; each @agent prompt becomes a
+ *   request file, pushed to Muse the moment it is written (lib/delivery.cjs,
+ *   when delivery is on);
+ * - the store is saved shortly after each change;
+ * - prompt expiry is one timer for the next open prompt's deadline;
+ * - the outage alert is one deadline, armed while disconnected;
+ * - the WhatsApp version is refreshed when reconnecting;
+ * - retention runs at start-up and after a save once a day has passed.
+ * The one periodic timer is the lifecycle heartbeat (lib/lifecycle.cjs): it
+ * writes down that the listener is alive, so the next run can tell how long
+ * nothing listened after a sudden kill. It reads and waits for nothing.
+ *
+ * Exit codes: 0 stopped by a signal, 1 error, 2 no linked session, 3 another
+ * listener already holds the session (neither 2 nor 3 is restarted by systemd).
  */
 
 'use strict';
@@ -23,29 +37,44 @@ const { acquireLock, readHolder, holderAlive } = require('../lib/session-lock.cj
 const { createRuntime, kitPaths, errorMessage, FATAL_REASONS } = require('../lib/runtime.cjs');
 const { runCommand, buildReadResult, readOptions } = require('../lib/commands.cjs');
 const { parseArgs } = require('../lib/args.cjs');
-const { loadConfig, DEFAULTS } = require('../lib/config.cjs');
+const { loadConfig, loadDeliverySettings, DEFAULTS } = require('../lib/config.cjs');
 const { createStateBook } = require('../lib/state-book.cjs');
 const { createPromptEngine } = require('../lib/prompts.cjs');
 const { createAudit } = require('../lib/audit.cjs');
 const { createHealthMonitor, applyRetention, promptStats } = require('../lib/health.cjs');
 const { createLifecycle, writeEvent } = require('../lib/lifecycle.cjs');
+const { createDelivery, ledgerSummary, ledgerReport } = require('../lib/delivery.cjs');
+const { onCreated } = require('../lib/request-files.cjs');
+const { enableAutoFlush } = require('../lib/message-store.cjs');
 const ipc = require('../lib/ipc.cjs');
 
 const ROOT = path.join(__dirname, '..');
-const STORE_FLUSH_MS = 2000;
-const VERSION_REFRESH_MS = 6 * 3600 * 1000;
+// A change is saved this long after it happens; later changes ride along.
+const STORE_SAVE_DELAY_MS = 250;
+const RETENTION_EVERY_MS = 24 * 3600 * 1000;
 const COMMAND_OPEN_WAIT_MS = 30000;
 // Missed prompts are reported once the first offline batch has gone quiet:
 // Baileys decrypts queued messages after the end-of-offline signal.
 const MISSED_QUIET_MS = 5000;
 const MISSED_MAX_WAIT_MS = 3 * 60000;
+const STOP_WAIT_MS = 5000;
+const STOP_FLUSH_MS = 2000;
+const EXIT_ANOTHER_LISTENER = 3;
 
 // Set as early as possible in main(), so a failure during start-up is
-// reported as a crash event too.
+// reported (and pushed) as a crash event too.
 let lifecycleRef = null;
+let deliveryRef = null;
 
 function log(...args) {
   console.error(`[listener ${new Date().toISOString()}]`, ...args);
+}
+
+const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
+
+/** The config to run with when muse-config.json is invalid: defaults, but still able to push. */
+function fallbackConfig() {
+  return { ...DEFAULTS, delivery: loadDeliverySettings(ROOT) || DEFAULTS.delivery };
 }
 
 async function takeLock(paths) {
@@ -53,7 +82,7 @@ async function takeLock(paths) {
     const holder = readHolder(paths.lock);
     if (holder && holder.label === 'listener' && holderAlive(holder)) {
       log(`another listener is already running (pid ${holder.pid}); exiting`);
-      process.exit(1);
+      process.exit(EXIT_ANOTHER_LISTENER);
     }
     try {
       return await acquireLock(paths.lock, { waitMs: 30000, label: 'listener' });
@@ -71,7 +100,9 @@ async function main() {
   // Never create auth/: without a linked session there is nothing to listen with.
   const cannotStart = () => {
     let config = DEFAULTS;
-    try { config = loadConfig(ROOT, { log }); } catch { /* the event still goes out, with the defaults */ }
+    try { config = loadConfig(ROOT, { log }); } catch { config = fallbackConfig(); }
+    // Pushed before exiting: nothing restarts a listener that has no session.
+    onCreated(createDelivery({ root: ROOT, config, log, standalone: true }).notify);
     writeEvent({
       root: ROOT, config, log, event: 'cannot-start', title: 'WhatsApp listener cannot start', notify: true,
       lines: [
@@ -85,26 +116,52 @@ async function main() {
   if (!fs.existsSync(path.join(paths.auth, 'creds.json'))) cannotStart();
   const lock = await takeLock(paths);
 
-  // The lifecycle first: everything after this can fail, and a failure must
-  // reach Muse as an event, not only the journal.
+  // Delivery and the lifecycle first: everything after this can fail, and a
+  // failure must reach Muse as an event, not only the journal.
   let config = null;
   let configError = null;
   try { config = loadConfig(ROOT, { log }); } catch (e) { configError = e; }
-  const audit = createAudit(paths.audit);
   // With an unreadable config, events still go out, using the built-in defaults.
-  const lifecycle = createLifecycle({ root: ROOT, config: config || DEFAULTS, log, audit });
+  const effective = config || fallbackConfig();
+  const audit = createAudit(paths.audit);
+  const delivery = createDelivery({ root: ROOT, config: effective, log, audit });
+  deliveryRef = delivery;
+  onCreated((dir, name) => delivery.notify(dir, name));
+  try { delivery.init(); } catch (e) { log(`warning: delivery could not start: ${errorMessage(e)}`); }
+  const lifecycle = createLifecycle({ root: ROOT, config: effective, log, audit });
   lifecycleRef = lifecycle;
   let onFatalError = (e) => {
     log(`unexpected error during start-up: ${errorMessage(e)}`);
+    delivery.setSync(true);
     lifecycle.stopped('crashed', errorMessage(e));
     process.exit(1);
   };
   process.on('uncaughtException', (e) => onFatalError(e));
   if (configError) throw configError;
+  // Pushed now: files written while no listener ran, and pushes a crash cut short.
+  delivery.reconcile();
 
   const rt = await createRuntime({ root: ROOT, command: 'listen', mode: 'listener', log });
   if (!rt.isLinked()) cannotStart();
   await rt.resolveVersion();
+
+  let lastRetentionAt = 0;
+  const runRetention = () => {
+    lastRetentionAt = Date.now();
+    try { applyRetention({ rt, config, root: ROOT, audit }); } catch (e) { log(`warning: retention failed: ${errorMessage(e)}`); }
+  };
+  const autosave = enableAutoFlush(rt.store, {
+    delayMs: STORE_SAVE_DELAY_MS,
+    onError: (e) => log(`warning: could not save the message store: ${errorMessage(e)}`),
+    // Retention is time-based but needs no timer: a day after the last run,
+    // the next save runs it (and every start-up does).
+    onFlushed: () => {
+      if (lastRetentionAt && Date.now() - lastRetentionAt >= RETENTION_EVERY_MS) {
+        lastRetentionAt = Date.now();
+        setImmediate(runRetention);
+      }
+    },
+  });
 
   const book = createStateBook(paths.state);
   const prompts = createPromptEngine({ rt, book, config, root: ROOT, log, audit });
@@ -122,16 +179,17 @@ async function main() {
   rt.events.on('open', () => {
     log('connected to WhatsApp');
     lifecycle.setListening(true);
+    // Connected, so ⌛ can be sent: expire what ran out while not connected,
+    // then keep one timer armed for the next deadline.
+    prompts.startExpiry();
   });
   rt.events.on('disconnected', () => {
     log('disconnected; reconnecting');
     lifecycle.setListening(false);
     if (gapSince === null) gapSince = Math.floor(Date.now() / 1000);
   });
-  let lastAppendAt = 0;
-  rt.events.on('messages', (messages, type) => {
+  rt.events.on('messages', (messages) => {
     lastMessageAt = new Date().toISOString();
-    if (type === 'append') lastAppendAt = Date.now();
     prompts.handleMessages(messages);
   });
   rt.events.on('edited', (targets) => prompts.handleEdits(targets));
@@ -139,19 +197,24 @@ async function main() {
   // that reached the store while the listener was not running.
   rt.events.on('drained', () => {
     prompts.scanStore();
+    prompts.checkExpired();
     if (gapSince === null) return;
     const since = gapSince;
     gapSince = null;
-    // Wait until the offline batch has stopped arriving (a long outage can
-    // mean hundreds of queued messages), then report.
+    // Report once the offline batch has stopped arriving (a long outage can
+    // mean hundreds of queued messages): a quiet period, restarted by each
+    // new batch, and at most MISSED_MAX_WAIT_MS in all.
     const drainedAt = Date.now();
-    const report = () => {
-      const settling = Date.now() - lastAppendAt < MISSED_QUIET_MS && Date.now() - drainedAt < MISSED_MAX_WAIT_MS;
-      if (settling) {
-        const t = setTimeout(report, 1000);
-        if (t.unref) t.unref();
-        return;
-      }
+    let quiet = null;
+    const onBatch = (_messages, type) => { if (type === 'append') arm(); };
+    function arm() {
+      if (quiet) clearTimeout(quiet);
+      const left = MISSED_MAX_WAIT_MS - (Date.now() - drainedAt);
+      quiet = setTimeout(report, Math.max(0, Math.min(MISSED_QUIET_MS, left)));
+      if (quiet.unref) quiet.unref();
+    }
+    function report() {
+      rt.events.removeListener('messages', onBatch);
       Promise.resolve(prompts.scanStore()).then(() => {
         const fresh = prompts.missedPrompts(since).filter((m) => !book.marked(`missed:${m.chatJid}/${m.id}`));
         if (!fresh.length) return;
@@ -159,9 +222,9 @@ async function main() {
         book.save();
         lifecycle.missedPrompts(fresh, (jid) => rt.store.chatName(jid));
       }).catch((e) => log(`warning: missed-prompt check failed: ${errorMessage(e)}`));
-    };
-    const t = setTimeout(report, MISSED_QUIET_MS);
-    if (t.unref) t.unref();
+    }
+    rt.events.on('messages', onBatch);
+    arm();
   });
   prompts.recoverPending();
   rt.events.on('fatal', (code) => {
@@ -179,18 +242,34 @@ async function main() {
     reconnects: rt.diag.reconnects,
     lastMessageAt,
     stats: promptStats(book),
+    delivery: { enabled: !!effective.delivery.enabled, active: delivery.active },
+    nextExpiryAt: prompts.nextExpiryAt ? new Date(prompts.nextExpiryAt).toISOString() : null,
   });
 
-  async function handleRequest({ argv = [], cwd = ROOT } = {}) {
+  function deliveryCommand(args) {
+    const sub = args._[1] || 'status';
+    if (sub === 'flush') {
+      // Not active here (turned on after this listener started): say so, and
+      // the caller (bin/lifecycle-event.cjs) pushes the file by itself.
+      if (!delivery.active) return { exit: 1, out: [{ flushed: false, active: false }], err: ['delivery: not active in this listener; restart it to pick up the delivery settings'] };
+      return { exit: 0, out: [{ flushed: true, ...delivery.reconcile() }], err: [] };
+    }
+    if (sub === 'report') return { exit: 0, out: [ledgerReport(ROOT, { since: args.since || null, limit: Number.isFinite(args.limit) ? args.limit : 200 })], err: [] };
+    return { exit: 0, out: [ledgerSummary(ROOT, effective)], err: [] };
+  }
+
+  async function answer({ argv = [], cwd = ROOT } = {}) {
     const args = parseArgs(argv);
     const command = args._[0];
     if (command === 'pair' || command === 'pair-qr') {
       return { exit: 1, out: [], err: ['error: the listener is running and holds the session; stop the listener service before pairing'] };
     }
+    if (command === 'delivery') return deliveryCommand(args);
     if (rt.fatalCode === 401) {
       return { exit: 2, out: [{ connected: false, needsPairing: true, reason: 'logged_out' }], err: [] };
     }
     if (command === 'status') {
+      health.check(); // on demand: an outage alert is never later than this
       const connected = rt.connectionState === 'open';
       const body = { connected, me: rt.me(), listener: listenerInfo(), diag: rt.diag };
       if (!connected) body.reason = FATAL_REASONS[rt.fatalCode] || 'reconnecting';
@@ -216,22 +295,17 @@ async function main() {
     });
   }
 
+  async function handleRequest(req) {
+    try {
+      return await answer(req);
+    } finally {
+      // A reply, escalation or reaction may have changed a prompt's deadline.
+      prompts.scheduleExpiry();
+    }
+  }
+
   const server = await ipc.serve(paths.socket, handleRequest);
-  const flushTimer = setInterval(() => {
-    try { rt.store.flush(); } catch (e) { log(`warning: could not save the message store: ${errorMessage(e)}`); }
-  }, STORE_FLUSH_MS);
-  const runRetention = () => {
-    try { applyRetention({ rt, config, root: ROOT, audit }); } catch (e) { log(`warning: retention failed: ${errorMessage(e)}`); }
-  };
   runRetention();
-  const retentionTimer = setInterval(runRetention, 24 * 3600 * 1000);
-  const healthTimer = setInterval(() => health.check(),
-    Math.max(500, Math.min(30000, (config.health.alertAfterMinutes * 60000) / 4)));
-  const expiryTimer = setInterval(() => prompts.checkExpired(),
-    Math.max(1000, Math.min(60000, (config.expireAfterMinutes * 60000) / 4)));
-  const versionTimer = setInterval(() => {
-    rt.resolveVersion().catch((e) => log(`warning: version refresh failed: ${errorMessage(e)}`));
-  }, VERSION_REFRESH_MS);
   log(`listening (pid ${process.pid})`);
   lifecycle.started();
 
@@ -240,16 +314,23 @@ async function main() {
     if (stopping) return;
     stopping = true;
     log(`stopping (${why})`);
-    lifecycle.stopped(why === 'error' ? 'crashed' : why, error);
-    clearInterval(flushTimer);
-    clearInterval(retentionTimer);
-    clearInterval(healthTimer);
-    clearInterval(expiryTimer);
-    clearInterval(versionTimer);
+    prompts.stopTimers();
+    health.stop();
     try { server.close(); } catch { /* ignore */ }
-    await Promise.race([prompts.idle(), new Promise((r) => setTimeout(r, 5000))]);
     try { fs.unlinkSync(paths.socket); } catch { /* ignore */ }
+    const settle = (ms) => Promise.race([Promise.all([prompts.idle(), delivery.idle()]), sleep(ms)]);
+    // Prompt handling and pushes in flight finish first (bounded).
+    await settle(STOP_WAIT_MS);
+    // Then the store and the session keys are saved, before anything else
+    // can hold the process up past systemd's stop timeout.
     await rt.shutdown();
+    autosave.stop();
+    // What the shutdown released (held-back events) is handled and pushed;
+    // then the stop event itself is pushed, synchronously, before the exit.
+    await settle(STOP_FLUSH_MS);
+    delivery.setSync(true);
+    lifecycle.stopped(why === 'error' ? 'crashed' : why, error);
+    delivery.stop();
     lock.release();
     process.exit(code);
   };
@@ -264,6 +345,7 @@ async function main() {
 
 main().catch((e) => {
   log(`error: ${errorMessage(e)}`);
+  if (deliveryRef) deliveryRef.setSync(true);
   if (lifecycleRef) lifecycleRef.stopped('crashed', errorMessage(e));
   process.exit(1);
 });

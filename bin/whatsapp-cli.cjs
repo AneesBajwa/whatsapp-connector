@@ -44,6 +44,10 @@
  *   node whatsapp-cli.cjs watchlist list | add --jid <jid> [--name "..."] | remove --jid <jid>
  *     (add/remove only apply when muse-config.json has "allChats": false; by
  *      default @agent works in every chat. list also shows allChats)
+ *   node whatsapp-cli.cjs delivery status | report [--since <ISO time>] [--limit N] | flush
+ *     (push delivery of requests/ to Muse: how it is set up and doing, one
+ *      row per file pushed, or "deliver what is waiting now" (listener only).
+ *      Needs no WhatsApp connection)
  * Options for connected commands: [--lock-wait <s>] [--sync-wait <s>]
  *
  * JSON goes to stdout; diagnostics go to stderr, and connected commands also
@@ -66,9 +70,11 @@ const { createAudit } = require('../lib/audit.cjs');
 const { createStore, messageText, toUnix, toISO: unixToISO } = require('../lib/message-store.cjs');
 const { parseArgs, seconds } = require('../lib/args.cjs');
 const ipc = require('../lib/ipc.cjs');
+const { createDelivery, ledgerSummary, ledgerReport } = require('../lib/delivery.cjs');
+const { onCreated } = require('../lib/request-files.cjs');
 
 const ROOT = path.join(__dirname, '..');
-const COMMANDS = ['status', 'pair', 'pair-qr', 'sync', 'chats', 'read', 'search', 'download', 'send', 'edit', 'delete', 'react', 'reply', 'escalate', 'watchlist'];
+const COMMANDS = ['status', 'pair', 'pair-qr', 'sync', 'chats', 'read', 'search', 'download', 'send', 'edit', 'delete', 'react', 'reply', 'escalate', 'watchlist', 'delivery'];
 const DEFAULT_LOCK_WAIT_S = 120;
 const DEFAULT_SYNC_WAIT_S = 45;
 
@@ -210,6 +216,30 @@ async function main() {
     return;
   }
 
+  // Delivery needs no session: the listener answers it, or the files on disk do.
+  if (command === 'delivery') {
+    const reply = await ipc.request(paths.socket, { argv, cwd: process.cwd() }, { timeoutMs: 30000 });
+    if (reply) {
+      for (const line of reply.err || []) console.error(line);
+      for (const obj of reply.out || []) console.log(JSON.stringify(obj));
+      exitWhenFlushed(Number.isInteger(reply.exit) ? reply.exit : 1);
+      return;
+    }
+    const sub = args._[1] || 'status';
+    if (sub === 'flush') {
+      console.error('error: the listener is not running; it delivers what is waiting when it starts');
+      process.exit(1);
+    }
+    let config;
+    try { config = loadConfig(ROOT, { log }); } catch (e) { console.error(`error: ${errorMessage(e)}`); process.exit(1); }
+    const out = sub === 'report'
+      ? ledgerReport(ROOT, { since: args.since || null, limit: Number.isFinite(args.limit) ? args.limit : 200 })
+      : { ...ledgerSummary(ROOT, config), listenerRunning: false };
+    console.log(JSON.stringify(out));
+    exitWhenFlushed(0);
+    return;
+  }
+
   // A running listener holds the session: hand the command to it.
   if (!(command === 'read' && args.cached)) {
     let reply = await ipc.request(paths.socket, { argv, cwd: process.cwd() });
@@ -325,10 +355,13 @@ async function main() {
     await rt.waitForOpen(90000);
     await rt.waitForSync(seconds(args.syncWait, DEFAULT_SYNC_WAIT_S) * 1000);
     const needsState = ['react', 'reply', 'escalate', 'watchlist', 'send', 'edit', 'delete'].includes(command);
+    const config = needsState ? loadConfig(ROOT, { log }) : null;
+    // No listener: a file this run writes for Muse (an escalation) is pushed by this run.
+    if (config) onCreated(createDelivery({ root: ROOT, config, log, standalone: true }).notify);
     const res = await runCommand(rt, command, args, {
       cwd: process.cwd(),
       book: needsState ? createStateBook(paths.state) : null,
-      config: needsState ? loadConfig(ROOT, { log }) : null,
+      config,
       audit: createAudit(paths.audit),
     });
     for (const line of res.err) console.error(line);

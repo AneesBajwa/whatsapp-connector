@@ -1,5 +1,9 @@
-# systemd unit for the WhatsApp push listener (bin/listen.cjs).
-# Replace the four <...> values (get the node path with: command -v node), then:
+# systemd unit for the WhatsApp push listener (bin/listen.cjs), system scope.
+# Prefer the user-scope unit (muse-whatsapp-listener.user.service) where the
+# VM supports it: it lives in the home folder, which survives a VM
+# replacement; /etc does not. deploy/install-listener.sh installs either.
+#
+# By hand: replace the four <...> values (node path: command -v node), then
 #   sudo cp deploy/muse-whatsapp-listener.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now muse-whatsapp-listener
@@ -7,12 +11,16 @@
 #
 # Exit codes: 0 stopped by a signal, 1 error (restarted), 2 no linked session
 # in auth/ (not restarted: the listener never pairs; the device must be linked
-# from home with pair-qr).
+# from home with pair-qr), 3 another listener already holds the session (not
+# restarted, so two supervisors never fight over it).
 
 [Unit]
 Description=Muse WhatsApp listener (Baileys connector)
 After=network-online.target
 Wants=network-online.target
+# Never stop restarting it: a crash loop is reported by the listener itself
+# (Kind: lifecycle, crash-loop), not by systemd giving up silently.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -23,14 +31,15 @@ Environment=NODE_USE_ENV_PROXY=1
 # HTTPS_PROXY=... and anything else the VM needs; keep this file mode 600.
 EnvironmentFile=-<absolute path to the connector folder>/listener.env
 ExecStart=<absolute path to node> bin/listen.cjs
-Restart=on-failure
+# Back after any exit that systemd did not ask for (a crash, a kill), except 2 and 3.
+Restart=always
 RestartSec=10
-RestartPreventExitStatus=2
+RestartPreventExitStatus=2 3
 UMask=0077
-# SIGTERM: the listener saves the store, closes the connection and releases
-# session.lock before exiting.
+# SIGTERM: the listener saves the store, pushes its stop event, closes the
+# connection and releases session.lock before exiting.
 KillSignal=SIGTERM
-TimeoutStopSec=20
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

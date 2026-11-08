@@ -1,0 +1,36 @@
+# systemd unit for the WhatsApp push listener (bin/listen.cjs), user scope.
+#
+# Why user scope: the unit and its enable link live in
+# ~/.config/systemd/user/, in the home folder, which survives a VM
+# replacement (/etc does not). With lingering on for the connector's user
+# (loginctl enable-linger), that user's systemd starts at boot and starts the
+# listener, with nobody logged in and nothing watching it.
+#
+# Installed by: deploy/install-listener.sh --scope user (as the folder's
+# owner, not root). By hand: fill in the three <...> values, then
+#   mkdir -p ~/.config/systemd/user && cp deploy/muse-whatsapp-listener.user.service ~/.config/systemd/user/muse-whatsapp-listener.service
+#   systemctl --user daemon-reload && systemctl --user enable --now muse-whatsapp-listener
+#   journalctl --user -u muse-whatsapp-listener -f
+#
+# Exit codes as in muse-whatsapp-listener.service: 2 (no linked session) and 3
+# (another listener holds the session) are not restarted; anything else is.
+
+[Unit]
+Description=Muse WhatsApp listener (Baileys connector)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=<absolute path to the connector folder>
+Environment=NODE_USE_ENV_PROXY=1
+EnvironmentFile=-<absolute path to the connector folder>/listener.env
+ExecStart=<absolute path to node> bin/listen.cjs
+Restart=always
+RestartSec=10
+RestartPreventExitStatus=2 3
+UMask=0077
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

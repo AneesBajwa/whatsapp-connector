@@ -4,7 +4,7 @@
   "description": "",
   "main": "bin/whatsapp-cli.cjs",
   "scripts": {
-    "test": "node --test test/store.test.cjs test/polls.test.cjs test/cli.test.cjs test/listener.test.cjs test/prompts.test.cjs test/search.test.cjs test/health.test.cjs test/reactions-edits-backfill.test.cjs test/pending-votes.test.cjs test/lifecycle.test.cjs test/store-fixes.test.cjs",
+    "test": "node --test test/store.test.cjs test/polls.test.cjs test/cli.test.cjs test/listener.test.cjs test/prompts.test.cjs test/search.test.cjs test/health.test.cjs test/reactions-edits-backfill.test.cjs test/pending-votes.test.cjs test/lifecycle.test.cjs test/store-fixes.test.cjs test/delivery.test.cjs test/timers.test.cjs test/supervision.test.cjs",
     "listen": "node bin/listen.cjs"
   },
   "keywords": [],

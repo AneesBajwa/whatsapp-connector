@@ -90,7 +90,9 @@ test('listener: a logged-out session reports that it needs pairing', () => withL
 test('listener: a second listener will not start', () => withListener({}, async (kit) => {
   const second = kit.startListener();
   const { code } = await second.exited;
-  assert.equal(code, 1);
+  // 3 = another listener holds the session: systemd's RestartPreventExitStatus
+  // keeps a supervised duplicate from restarting in a loop.
+  assert.equal(code, 3);
   assert.equal(kit.count('socket'), 1);
 }));
 
