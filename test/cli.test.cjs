@@ -293,6 +293,60 @@ test('send: the sent message is stored as sent by the connector', () => withKit(
   assert.equal(r.result.messages[0].sentByConnector, true);
 }));
 
+// Nov 9: 1:1 DMs to 10-digit numbers went to <digits>@s.whatsapp.net with no
+// country code (6477733430 is +64, not +1 647), and the CLI reported
+// sent:true without waiting for WhatsApp's ack.
+const KNOWN_PN = '15550001234@s.whatsapp.net';
+const KNOWN_LID = '900000000001234@lid';
+
+function writeAliases(kit) {
+  fs.mkdirSync(kit.path('store'), { recursive: true });
+  fs.writeFileSync(kit.path('store/aliases.json'), JSON.stringify({ [KNOWN_PN]: KNOWN_LID, [KNOWN_LID]: KNOWN_PN }));
+}
+
+test('send: a 10-digit number whose 1-prefixed form is a known contact is refused, not sent abroad', () => withKit({}, (kit) => {
+  writeAliases(kit);
+  const r = kit.cli(['send', '--jid', '5550001234', '--text', 'hi']);
+  assert.equal(r.exit, 1);
+  assert.match(r.stderr, /no country code/);
+  assert.match(r.stderr, /--jid 15550001234/);
+  assert.equal(kit.sends().length, 0);
+}));
+
+test('send: the number with its country code goes to the contact\'s phone-number JID', () => withKit({}, (kit) => {
+  writeAliases(kit);
+  const r = kit.cli(['send', '--jid', '+1 555-000-1234', '--text', 'hi']);
+  assert.equal(r.exit, 0, r.stderr);
+  assert.equal(r.result.sent, true);
+  assert.equal(r.result.jid, KNOWN_PN);
+  assert.equal(kit.sends()[0].jid, KNOWN_PN);
+}));
+
+test('send: a number with no WhatsApp account is refused before sending', () => withKit({}, (kit) => {
+  const r = kit.cli(['send', '--jid', '6400000000', '--text', 'hi'], { sim: { notOnWhatsApp: ['6400000000@s.whatsapp.net'] } });
+  assert.equal(r.exit, 1);
+  assert.match(r.stderr, /no WhatsApp account/);
+  assert.equal(kit.sends().length, 0);
+}));
+
+test('send: a 1:1 message the server rejects is reported as not sent, not stored as sent by the connector', () => withKit({}, (kit) => {
+  const r = kit.cli(['send', '--jid', KNOWN_LID, '--text', 'hi'], { sim: { ackErrors: { [KNOWN_LID]: '463' } } });
+  assert.equal(r.exit, 1);
+  assert.notEqual(r.result && r.result.sent, true);
+  assert.match(r.stderr, /rejected .*error 463/);
+  const read = kit.cli(['read', '--jid', KNOWN_LID, '--cached']);
+  assert.equal(read.result.count, 1);
+  assert.ok(read.result.messages.every((m) => !m.sentByConnector));
+  assert.ok(read.result.messages.every((m) => m.sendFailed === '463'));
+}));
+
+test('send: a group send still succeeds once the server acks it', () => withKit({}, (kit) => {
+  const r = kit.cli(['send', '--jid', GROUP, '--text', 'hi all'], { sim: { notOnWhatsApp: [GROUP] } });
+  assert.equal(r.exit, 0, r.stderr);
+  assert.equal(r.result.sent, true);
+  assert.equal(kit.count(`onWhatsApp ${GROUP}`), 0, 'groups are never looked up as phone numbers');
+}));
+
 // ---------------------------------------------------------------- session lock, store, version
 
 test('a second copy waits for the session lock, then gives up without connecting', () => withKit({}, (kit) => {
