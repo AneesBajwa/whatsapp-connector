@@ -152,10 +152,21 @@ const makeWASocket = () => {
     }
   }, 20);
 
+  // The frame emitter: the server acks every message stanza with
+  // 'CB:ack,class:message'. sim.ackErrors: { '<jid>': '<code>' } rejects
+  // sends to that JID, as the server does (e.g. 463).
+  const ws = new EventEmitter();
+
   return {
     ev,
+    ws,
     end,
     get user() { return creds.me; },
+    // sim.notOnWhatsApp: phone-number JIDs with no account.
+    onWhatsApp: async (...jids) => {
+      record('onWhatsApp ' + jids.join(','));
+      return jids.filter((j) => !(sim.notOnWhatsApp || []).includes(j)).map((j) => ({ jid: j, exists: true }));
+    },
     waitForSocketOpen: async () => {},
     requestPairingCode: async () => {
       record('requestPairingCode');
@@ -236,6 +247,10 @@ const makeWASocket = () => {
       } else if (content.react) {
         ev.emit('messages.reaction', [{ key: content.react.key, reaction: { ...content.react, key } }]);
       }
+      const ackError = (sim.ackErrors || {})[jid];
+      setTimeout(() => ws.emit('CB:ack,class:message', {
+        tag: 'ack', attrs: { class: 'message', id: key.id, from: jid, ...(ackError ? { error: ackError } : {}) },
+      }), 10);
       return full;
     },
   };
